@@ -1,0 +1,202 @@
+package database
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/cockroachdb/errors"
+	log "unknwon.dev/clog/v2"
+
+	"gogs.io/gogs/internal/conf"
+	"gogs.io/gogs/internal/email"
+	"gogs.io/gogs/internal/markup"
+	"gogs.io/gogs/internal/strx"
+	"gogs.io/gogs/internal/userx"
+)
+
+func (issue *Issue) MailSubject() string {
+	return fmt.Sprintf("[%s] %s (#%d)", issue.Repo.Name, issue.Title, issue.Index)
+}
+
+// mailerUser is a wrapper for satisfying mailer.User interface.
+type mailerUser struct {
+	user *User
+}
+
+func (mu mailerUser) ID() int64 {
+	return mu.user.ID
+}
+
+func (mu mailerUser) DisplayName() string {
+	return mu.user.DisplayName()
+}
+
+func (mu mailerUser) Email() string {
+	return mu.user.Email
+}
+
+func (mu mailerUser) GenerateEmailActivateCode(email string) string {
+	return userx.GenerateActivateCode(
+		mu.user.ID,
+		email,
+		mu.user.Name,
+		mu.user.Password,
+		mu.user.Rands,
+	)
+}
+
+func (mu mailerUser) GenerateEmailResetPasswordCode(email string) string {
+	return userx.GenerateResetPasswordCode(
+		mu.user.ID,
+		email,
+		mu.user.Name,
+		mu.user.Password,
+		mu.user.Rands,
+	)
+}
+
+func NewMailerUser(u *User) email.User {
+	return mailerUser{u}
+}
+
+// mailerRepo is a wrapper for satisfying mailer.Repository interface.
+type mailerRepo struct {
+	repo *Repository
+}
+
+func (mr mailerRepo) FullName() string {
+	return mr.repo.FullName()
+}
+
+func (mr mailerRepo) HTMLURL() string {
+	return mr.repo.HTMLURL()
+}
+
+func (mr mailerRepo) ComposeMetas() map[string]string {
+	return mr.repo.ComposeMetas()
+}
+
+func NewMailerRepo(repo *Repository) email.Repository {
+	return mailerRepo{repo}
+}
+
+// mailerIssue is a wrapper for satisfying mailer.Issue interface.
+type mailerIssue struct {
+	issue *Issue
+}
+
+func (mi mailerIssue) MailSubject() string {
+	return mi.issue.MailSubject()
+}
+
+func (mi mailerIssue) Content() string {
+	return mi.issue.Content
+}
+
+func (mi mailerIssue) HTMLURL() string {
+	return mi.issue.HTMLURL()
+}
+
+func NewMailerIssue(issue *Issue) email.Issue {
+	return mailerIssue{issue}
+}
+
+// mailIssueCommentToParticipants can be used for both new issue creation and comment.
+// This functions sends two list of emails:
+// 1. Repository watchers, users who participated in comments and the assignee.
+// 2. Users who are not in 1. but get mentioned in current issue/comment.
+func mailIssueCommentToParticipants(issue *Issue, doer *User, mentions []string) error {
+	ctx := context.TODO()
+
+	if !conf.User.EnableEmailNotification {
+		return nil
+	}
+
+	watchers, err := GetWatchers(issue.RepoID)
+	if err != nil {
+		return errors.Newf("GetWatchers [repo_id: %d]: %v", issue.RepoID, err)
+	}
+	participants, err := GetParticipantsByIssueID(issue.ID)
+	if err != nil {
+		return errors.Newf("GetParticipantsByIssueID [issue_id: %d]: %v", issue.ID, err)
+	}
+
+	// In case the issue poster is not watching the repository,
+	// even if we have duplicated in watchers, can be safely filtered out.
+	if issue.PosterID != doer.ID {
+		participants = append(participants, issue.Poster)
+	}
+
+	tos := make([]string, 0, len(watchers)) // List of email addresses
+	names := make([]string, 0, len(watchers))
+	for i := range watchers {
+		if watchers[i].UserID == doer.ID {
+			continue
+		}
+
+		to, err := Handle.Users().GetByID(ctx, watchers[i].UserID)
+		if err != nil {
+			return errors.Newf("GetUserByID [%d]: %v", watchers[i].UserID, err)
+		}
+		if to.IsOrganization() || !to.IsActive {
+			continue
+		}
+
+		tos = append(tos, to.Email)
+		names = append(names, to.Name)
+	}
+	for i := range participants {
+		if participants[i].ID == doer.ID {
+			continue
+		} else if strx.ContainsFold(names, participants[i].Name) {
+			continue
+		}
+
+		tos = append(tos, participants[i].Email)
+		names = append(names, participants[i].Name)
+	}
+	if issue.Assignee != nil && issue.Assignee.ID != doer.ID {
+		if !strx.ContainsFold(names, issue.Assignee.Name) {
+			tos = append(tos, issue.Assignee.Email)
+			names = append(names, issue.Assignee.Name)
+		}
+	}
+	if err = email.SendIssueCommentMail(NewMailerIssue(issue), NewMailerRepo(issue.Repo), NewMailerUser(doer), tos); err != nil {
+		return errors.Wrap(err, "send issue comment mail")
+	}
+
+	// Mail mentioned people and exclude watchers.
+	names = append(names, doer.Name)
+	toUsernames := make([]string, 0, len(mentions)) // list of user names.
+	for i := range mentions {
+		if strx.ContainsFold(names, mentions[i]) {
+			continue
+		}
+
+		toUsernames = append(toUsernames, mentions[i])
+	}
+
+	tos, err = Handle.Users().GetMailableEmailsByUsernames(ctx, toUsernames)
+	if err != nil {
+		return errors.Wrap(err, "get mailable emails by usernames")
+	}
+	if err = email.SendIssueMentionMail(NewMailerIssue(issue), NewMailerRepo(issue.Repo), NewMailerUser(doer), tos); err != nil {
+		return errors.Wrap(err, "send issue mention mail")
+	}
+	return nil
+}
+
+// MailParticipants sends new issue thread created emails to repository watchers
+// and mentioned people.
+func (issue *Issue) MailParticipants() (err error) {
+	mentions := markup.FindAllMentions(issue.Content)
+	if err = updateIssueMentions(x, issue.ID, mentions); err != nil {
+		return errors.Newf("UpdateIssueMentions [%d]: %v", issue.ID, err)
+	}
+
+	if err = mailIssueCommentToParticipants(issue, issue.Poster, mentions); err != nil {
+		log.Error("mailIssueCommentToParticipants: %v", err)
+	}
+
+	return nil
+}

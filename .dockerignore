@@ -1,0 +1,16 @@
+scripts
+scripts/**
+.github/
+.github/**
+.dockerignore
+*.yml
+*.md
+.editorconfig
+.gitignore
+Dockerfile*
+gogs
+node_modules
+**/node_modules
+public/dist
+**/*.tsbuildinfo
+**/.vite
