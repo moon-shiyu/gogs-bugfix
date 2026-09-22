@@ -1,11 +1,11 @@
 package database
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -189,64 +189,64 @@ const (
 	MergeStyleRebase  MergeStyle = "rebase_before_merging"
 )
 
-// Merge merges pull request to base repository.
-// FIXME: add repoWorkingPull make sure two merges does not happen at same time.
-func (pr *PullRequest) Merge(doer *User, baseGitRepo *git.Repository, mergeStyle MergeStyle, commitDescription string) (err error) {
-	ctx := context.TODO()
+// mergeExecutionOptions controls a guarded merge write.
+type mergeExecutionOptions struct {
+	// expectedBaseSHA is the target branch tip captured when checks passed.
+	// The push is rejected when the remote tip differs, i.e. someone pushed to
+	// the target branch while checks were running.
+	expectedBaseSHA string
+}
 
-	defer func() {
-		go HookQueue.Add(pr.BaseRepo.ID)
-		go AddTestPullRequestTask(doer, pr.BaseRepo.ID, pr.BaseBranch, false)
-	}()
-
-	sess := x.NewSession()
-	defer sess.Close()
-	if err = sess.Begin(); err != nil {
-		return err
-	}
-
-	if err = pr.Issue.changeStatus(sess, doer, pr.Issue.Repo, true); err != nil {
-		return errors.Newf("Issue.changeStatus: %v", err)
+// Merge merges pull request to base repository and returns the resulting merge
+// commit ID. It performs only the git write, callers must hold an idempotency
+// claim from MergePullRequestIdempotent so concurrent requests can not both
+// write the target branch.
+func (pr *PullRequest) Merge(doer *User, baseGitRepo *git.Repository, mergeStyle MergeStyle, commitDescription string, opts ...mergeExecutionOptions) (string, error) {
+	var opt mergeExecutionOptions
+	if len(opts) > 0 {
+		opt = opts[0]
 	}
 
 	headRepoPath := RepoPath(pr.HeadUserName, pr.HeadRepo.Name)
-	headGitRepo, err := git.Open(headRepoPath)
-	if err != nil {
-		return errors.Newf("open repository: %v", err)
-	}
 
 	// Create temporary directory to store temporary copy of the base repository,
 	// and clean it up when operation finished regardless of succeed or not.
-	tmpBasePath := filepath.Join(conf.Server.AppDataPath, "tmp", "repos", strconv.Itoa(time.Now().Nanosecond())+".git")
-	if err = os.MkdirAll(filepath.Dir(tmpBasePath), os.ModePerm); err != nil {
-		return err
+	// Each merge gets a unique directory. Removing only this directory (never
+	// the shared parent) is required for concurrent merges not to delete each
+	// other's working copy.
+	tmpBasePath := filepath.Join(conf.Server.AppDataPath, "tmp", "repos", strconv.FormatInt(time.Now().UnixNano(), 10))
+	var (
+		stderr string
+		err    error
+	)
+	if err = os.MkdirAll(tmpBasePath, os.ModePerm); err != nil {
+		return "", err
 	}
 	defer func() {
-		_ = os.RemoveAll(filepath.Dir(tmpBasePath))
+		_ = os.RemoveAll(tmpBasePath)
 	}()
 
 	// Clone the base repository to the defined temporary directory,
 	// and checks out to base branch directly.
-	var stderr string
 	if err = git.Clone(baseGitRepo.Path(), tmpBasePath, git.CloneOptions{
 		Branch:  pr.BaseBranch,
 		Timeout: 5 * time.Minute,
 	}); err != nil {
-		return errors.Newf("git clone: %v", err)
+		return "", errors.Newf("git clone: %v", err)
 	}
 
 	// Add remote which points to the head repository.
 	if _, stderr, err = process.ExecDir(-1, tmpBasePath,
 		fmt.Sprintf("PullRequest.Merge (git remote add): %s", tmpBasePath),
 		"git", "remote", "add", "head_repo", headRepoPath); err != nil {
-		return errors.Newf("git remote add [%s -> %s]: %s", headRepoPath, tmpBasePath, stderr)
+		return "", errors.Newf("git remote add [%s -> %s]: %s", headRepoPath, tmpBasePath, stderr)
 	}
 
 	// Fetch information from head repository to the temporary copy.
 	if _, stderr, err = process.ExecDir(-1, tmpBasePath,
 		fmt.Sprintf("PullRequest.Merge (git fetch): %s", tmpBasePath),
 		"git", "fetch", "head_repo"); err != nil {
-		return errors.Newf("git fetch [%s -> %s]: %s", headRepoPath, tmpBasePath, stderr)
+		return "", errors.Newf("git fetch [%s -> %s]: %s", headRepoPath, tmpBasePath, stderr)
 	}
 
 	remoteHeadBranch := "head_repo/" + pr.HeadBranch
@@ -263,7 +263,7 @@ func (pr *PullRequest) Merge(doer *User, baseGitRepo *git.Repository, mergeStyle
 		if _, stderr, err = process.ExecDir(-1, tmpBasePath,
 			fmt.Sprintf("PullRequest.Merge (git merge --no-ff --no-commit): %s", tmpBasePath),
 			"git", "merge", "--no-ff", "--no-commit", "--end-of-options", remoteHeadBranch); err != nil {
-			return errors.Newf("git merge --no-ff --no-commit [%s]: %v - %s", tmpBasePath, err, stderr)
+			return "", errors.Newf("git merge --no-ff --no-commit [%s]: %v - %s", tmpBasePath, err, stderr)
 		}
 
 		// Create a merge commit for the base branch.
@@ -272,7 +272,7 @@ func (pr *PullRequest) Merge(doer *User, baseGitRepo *git.Repository, mergeStyle
 			"git", "commit", fmt.Sprintf("--author='%s <%s>'", doer.DisplayName(), doer.Email),
 			"-m", fmt.Sprintf("Merge branch '%s' of %s/%s into %s", pr.HeadBranch, pr.HeadUserName, pr.HeadRepo.Name, pr.BaseBranch),
 			"-m", commitDescription); err != nil {
-			return errors.Newf("git commit [%s]: %v - %s", tmpBasePath, err, stderr)
+			return "", errors.Newf("git commit [%s]: %v - %s", tmpBasePath, err, stderr)
 		}
 
 	case MergeStyleRebase: // Rebase before merging
@@ -281,7 +281,7 @@ func (pr *PullRequest) Merge(doer *User, baseGitRepo *git.Repository, mergeStyle
 		if _, stderr, err = process.ExecDir(-1, tmpBasePath,
 			fmt.Sprintf("PullRequest.Merge (git rebase): %s", tmpBasePath),
 			"git", "rebase", "--quiet", "--end-of-options", pr.BaseBranch, remoteHeadBranch); err != nil {
-			return errors.Newf("git rebase [%s on %s]: %s", remoteHeadBranch, pr.BaseBranch, stderr)
+			return "", errors.Newf("git rebase [%s on %s]: %s", remoteHeadBranch, pr.HeadBranch, stderr)
 		}
 
 		// Name non-branch commit state to a new temporary branch in order to save changes.
@@ -289,107 +289,94 @@ func (pr *PullRequest) Merge(doer *User, baseGitRepo *git.Repository, mergeStyle
 		if _, stderr, err = process.ExecDir(-1, tmpBasePath,
 			fmt.Sprintf("PullRequest.Merge (git checkout): %s", tmpBasePath),
 			"git", "checkout", "-b", tmpBranch); err != nil {
-			return errors.Newf("git checkout '%s': %s", tmpBranch, stderr)
+			return "", errors.Newf("git checkout '%s': %s", tmpBranch, stderr)
 		}
 
 		// Check out the base branch to be operated on.
 		if _, stderr, err = process.ExecDir(-1, tmpBasePath,
 			fmt.Sprintf("PullRequest.Merge (git checkout): %s", tmpBasePath),
 			"git", "checkout", "--end-of-options", pr.BaseBranch); err != nil {
-			return errors.Newf("git checkout '%s': %s", pr.BaseBranch, stderr)
+			return "", errors.Newf("git checkout '%s': %s", pr.BaseBranch, stderr)
 		}
 
 		// Merge changes from temporary branch to the base branch.
 		if _, stderr, err = process.ExecDir(-1, tmpBasePath,
 			fmt.Sprintf("PullRequest.Merge (git merge): %s", tmpBasePath),
 			"git", "merge", "--end-of-options", tmpBranch); err != nil {
-			return errors.Newf("git merge [%s]: %v - %s", tmpBasePath, err, stderr)
+			return "", errors.Newf("git merge [%s]: %v - %s", tmpBasePath, err, stderr)
 		}
 
 	default:
-		return errors.Newf("unknown merge style: %s", mergeStyle)
+		return "", errors.Newf("unknown merge style: %s", mergeStyle)
 	}
 
-	// Push changes on base branch to upstream.
-	if err = git.Push(tmpBasePath, baseGitRepo.Path(), pr.BaseBranch); err != nil {
-		return errors.Newf("git push: %v", err)
-	}
-
-	pr.MergedCommitID, err = headGitRepo.BranchCommitID(pr.HeadBranch)
+	// Read the resulting merge commit before pushing so we can verify the
+	// remote tip afterwards.
+	mergedCommitID, stderr, err := process.ExecDir(-1, tmpBasePath,
+		fmt.Sprintf("PullRequest.Merge (git rev-parse): %s", tmpBasePath),
+		"git", "rev-parse", pr.BaseBranch)
 	if err != nil {
-		return errors.Newf("get head branch %q commit ID: %v", pr.HeadBranch, err)
+		return "", errors.Newf("get merge commit [%s]: %v - %s", tmpBasePath, err, stderr)
+	}
+	mergedCommitID = strings.TrimSpace(mergedCommitID)
+
+	if opt.expectedBaseSHA != "" {
+		// Git treats an identical source and destination ref as
+		// "Everything up-to-date" and skips the lease check. Compare against
+		// the live remote tip first so a retried merge can not be reported as
+		// successful while the target branch moved.
+		remoteTip, _, tipErr := process.ExecDir(-1, tmpBasePath,
+			fmt.Sprintf("PullRequest.Merge (git ls-remote): %s", tmpBasePath),
+			"git", "ls-remote", baseGitRepo.Path(), "refs/heads/"+pr.BaseBranch)
+		if tipErr != nil {
+			return "", errors.Newf("git ls-remote: %v - %s", tipErr, remoteTip)
+		}
+		fields := strings.Fields(strings.TrimSpace(remoteTip))
+		if len(fields) == 0 || !strings.EqualFold(fields[0], opt.expectedBaseSHA) {
+			return "", ErrMergeRequestChanged{args: map[string]any{
+				"reason":       "target branch changed while checks were running",
+				"base_branch":  pr.BaseBranch,
+				"expected":     opt.expectedBaseSHA,
+				"pull_request": pr.ID,
+			}}
+		}
 	}
 
-	pr.HasMerged = true
-	pr.Merged = time.Now()
-	pr.MergerID = doer.ID
-	if _, err = sess.ID(pr.ID).AllCols().Update(pr); err != nil {
-		return errors.Newf("update pull request: %v", err)
+	// Push with an atomic compare-and-swap against the base SHA captured when
+	// checks passed. Git refuses when the remote tip moved, this covers both
+	// non-fast-forward and fast-forward races so two merges can never both
+	// write the target branch.
+	pushArgs := []string{"push"}
+	if opt.expectedBaseSHA != "" {
+		lease := fmt.Sprintf("refs/heads/%s:%s", pr.BaseBranch, opt.expectedBaseSHA)
+		pushArgs = append(pushArgs, "--force-with-lease="+lease,
+			baseGitRepo.Path(),
+			fmt.Sprintf("%s:refs/heads/%s", mergedCommitID, pr.BaseBranch))
+	} else {
+		pushArgs = append(pushArgs, baseGitRepo.Path(), pr.BaseBranch)
+	}
+	if _, stderr, err = process.ExecDir(-1, tmpBasePath,
+		fmt.Sprintf("PullRequest.Merge (git push): %s", tmpBasePath),
+		"git", pushArgs...); err != nil {
+		lowerStderr := strings.ToLower(stderr)
+		if opt.expectedBaseSHA != "" && (strings.Contains(lowerStderr, "non-fast-forward") ||
+			strings.Contains(lowerStderr, "stale info") ||
+			strings.Contains(lowerStderr, "cannot force update the branch")) {
+			return "", ErrMergeRequestChanged{args: map[string]any{
+				"reason":       "target branch changed while checks were running",
+				"base_branch":  pr.BaseBranch,
+				"expected":     opt.expectedBaseSHA,
+				"pull_request": pr.ID,
+			}}
+		}
+		return "", errors.Newf("git push: %v - %s", err, stderr)
 	}
 
-	if err = sess.Commit(); err != nil {
-		return errors.Newf("commit: %v", err)
-	}
-
-	if err = Handle.Actions().MergePullRequest(ctx, doer, pr.Issue.Repo.Owner, pr.Issue.Repo, pr.Issue); err != nil {
-		log.Error("Failed to create action for merge pull request, pull_request_id: %d, error: %v", pr.ID, err)
-	}
-
-	// Reload pull request information.
-	if err = pr.LoadAttributes(); err != nil {
-		log.Error("LoadAttributes: %v", err)
-		return nil
-	}
-	if err = PrepareWebhooks(pr.Issue.Repo, HookEventTypePullRequest, &apiv1types.WebhookPullRequestPayload{
-		Action:      apiv1types.WebhookIssueClosed,
-		Index:       pr.Index,
-		PullRequest: pr.APIFormat(),
-		Repository:  pr.Issue.Repo.APIFormatLegacy(nil),
-		Sender:      doer.APIFormat(),
-	}); err != nil {
-		log.Error("PrepareWebhooks: %v", err)
-		return nil
-	}
-
-	commits, err := headGitRepo.RevList([]string{pr.MergeBase + "..." + pr.MergedCommitID})
-	if err != nil {
-		log.Error("Failed to list commits [merge_base: %s, merged_commit_id: %s]: %v", pr.MergeBase, pr.MergedCommitID, err)
-		return nil
-	}
-
-	// NOTE: It is possible that head branch is not fully sync with base branch
-	// for merge commits, so we need to get latest head commit and append merge
-	// commit manually to avoid strange diff commits produced.
-	mergeCommit, err := baseGitRepo.BranchCommit(pr.BaseBranch)
-	if err != nil {
-		log.Error("Failed to get base branch %q commit: %v", pr.BaseBranch, err)
-		return nil
-	}
-	if mergeStyle == MergeStyleRegular {
-		commits = append([]*git.Commit{mergeCommit}, commits...)
-	}
-
-	pcs, err := CommitsToPushCommits(commits).APIFormat(ctx, Handle.Users(), pr.BaseRepo.RepoPath(), pr.BaseRepo.HTMLURL())
-	if err != nil {
-		log.Error("Failed to convert to API payload commits: %v", err)
-		return nil
-	}
-
-	p := &apiv1types.WebhookPushPayload{
-		Ref:        git.RefsHeads + pr.BaseBranch,
-		Before:     pr.MergeBase,
-		After:      mergeCommit.ID.String(),
-		CompareURL: conf.Server.ExternalURL + pr.BaseRepo.ComposeCompareURL(pr.MergeBase, pr.MergedCommitID),
-		Commits:    pcs,
-		Repo:       pr.BaseRepo.APIFormatLegacy(nil),
-		Pusher:     pr.HeadRepo.MustOwner().APIFormat(),
-		Sender:     doer.APIFormat(),
-	}
-	if err = PrepareWebhooks(pr.BaseRepo, HookEventTypePush, p); err != nil {
-		log.Error("Failed to prepare webhooks: %v", err)
-		return nil
-	}
-	return nil
+	// Refresh the conflict-test queue after the target branch changed. The
+	// success notifications are dispatched separately and idempotently by the
+	// merge request record, so this never enqueues a second success event.
+	go AddTestPullRequestTask(doer, pr.BaseRepo.ID, pr.BaseBranch, false)
+	return mergedCommitID, nil
 }
 
 // testPatch checks if patch can be merged to base repository without conflict.

@@ -1,6 +1,7 @@
 package repo
 
 import (
+	"net/http"
 	"time"
 
 	log "unknwon.dev/clog/v2"
@@ -163,4 +164,61 @@ func DeleteBranchPost(c *context.Context) {
 		log.Error("Failed to prepare webhooks for %q: %v", database.HookEventTypeDelete, err)
 		return
 	}
+}
+
+// CreateStatusCheck is the background entry point for CI systems to report
+// check results. Results bind to the current target branch tip and rule
+// version, so a later push automatically invalidates them on the page.
+func CreateStatusCheck(c *context.Context) {
+	commitSHA := c.Params(":sha")
+	if c.Repo.GitRepo == nil {
+		log.Error("Git repository is not initialized for repository %d", c.Repo.Repository.ID)
+		c.JSON(http.StatusInternalServerError, map[string]any{"message": "repository is not initialized"})
+		return
+	}
+
+	var input database.CreateStatusCheckInput
+	if err := c.Req.ParseForm(); err != nil {
+		c.Error(err, "parse form")
+		return
+	}
+	input.Name = c.Query("name")
+	input.State = c.Query("state")
+	input.TargetURL = c.Query("target_url")
+	input.Description = c.Query("description")
+
+	if input.Name == "" {
+		c.JSON(http.StatusUnprocessableEntity, map[string]any{
+			"message": "check name is required",
+			"reason":  "missing_name",
+		})
+		return
+	}
+	if !database.IsValidStatusCheckState(input.State) {
+		c.JSON(http.StatusUnprocessableEntity, map[string]any{
+			"message": "check state must be one of pending, success, failure or error",
+			"reason":  "invalid_state",
+		})
+		return
+	}
+	if c.Query("branch") == "" {
+		c.JSON(http.StatusUnprocessableEntity, map[string]any{
+			"message": "target branch is required",
+			"reason":  "missing_branch",
+		})
+		return
+	}
+
+	check, err := database.RecordStatusCheck(c.Repo.Repository.ID, c.Query("branch"), commitSHA, input)
+	if err != nil {
+		log.Error("Failed to record status check [repo_id: %d, commit: %s]: %v", c.Repo.Repository.ID, commitSHA, err)
+		c.JSON(http.StatusInternalServerError, map[string]any{"message": "failed to record status check"})
+		return
+	}
+	c.JSON(http.StatusOK, map[string]any{
+		"id":           check.ID,
+		"state":        check.State,
+		"base_sha":     check.BaseSHA,
+		"rule_version": check.RuleVersion,
+	})
 }

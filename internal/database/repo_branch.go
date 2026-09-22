@@ -107,6 +107,12 @@ type ProtectBranch struct {
 	EnableWhitelist    bool
 	WhitelistUserIDs   string `xorm:"TEXT"`
 	WhitelistTeamIDs   string `xorm:"TEXT"`
+	// RequiredStatusChecks is the comma-separated list of check names that
+	// must report success against the current head commit before a merge.
+	RequiredStatusChecks string `xorm:"TEXT"`
+	// RuleVersion increments every time the protection options change. Merge
+	// attempts captured under an older version must re-evaluate the new rules.
+	RuleVersion int64
 }
 
 // GetProtectBranchOfRepoByName returns *ProtectBranch by branch name in given repository.
@@ -135,6 +141,8 @@ func IsBranchOfRepoRequirePullRequest(repoID int64, name string) bool {
 
 // UpdateProtectBranch saves branch protection options.
 // If ID is 0, it creates a new record. Otherwise, updates existing record.
+// RuleVersion is bumped whenever the effective options change so in-flight
+// merges can not keep using the old rules.
 func UpdateProtectBranch(protectBranch *ProtectBranch) (err error) {
 	sess := x.NewSession()
 	defer sess.Close()
@@ -142,17 +150,44 @@ func UpdateProtectBranch(protectBranch *ProtectBranch) (err error) {
 		return err
 	}
 
-	if protectBranch.ID == 0 {
-		if _, err = sess.Insert(protectBranch); err != nil {
-			return errors.Newf("insert: %v", err)
+	protectBranch.RequiredStatusChecks = formatRequiredStatusChecks(protectBranch.RequiredStatusCheckNames())
+
+	var previous *ProtectBranch
+	if protectBranch.ID != 0 {
+		previous = new(ProtectBranch)
+		if _, err = sess.ID(protectBranch.ID).Get(previous); err != nil {
+			return errors.Newf("get previous protect branch: %v", err)
 		}
 	}
 
-	if _, err = sess.ID(protectBranch.ID).AllCols().Update(protectBranch); err != nil {
-		return errors.Newf("update: %v", err)
+	if protectBranch.ID == 0 {
+		protectBranch.RuleVersion = 1
+		if _, err = sess.Insert(protectBranch); err != nil {
+			return errors.Newf("insert: %v", err)
+		}
+	} else {
+		if protectBranchRulesChanged(previous, protectBranch) {
+			protectBranch.RuleVersion = previous.RuleVersion + 1
+		} else {
+			protectBranch.RuleVersion = previous.RuleVersion
+		}
+		if _, err = sess.ID(protectBranch.ID).AllCols().Update(protectBranch); err != nil {
+			return errors.Newf("update: %v", err)
+		}
 	}
 
 	return sess.Commit()
+}
+
+// protectBranchRulesChanged reports whether a settings edit changes merge
+// relevant options. Whitelist membership edits also invalidate waiting merges.
+func protectBranchRulesChanged(before, after *ProtectBranch) bool {
+	return before.Protected != after.Protected ||
+		before.RequirePullRequest != after.RequirePullRequest ||
+		formatRequiredStatusChecks(before.RequiredStatusCheckNames()) != formatRequiredStatusChecks(after.RequiredStatusCheckNames()) ||
+		before.EnableWhitelist != after.EnableWhitelist ||
+		before.WhitelistUserIDs != after.WhitelistUserIDs ||
+		before.WhitelistTeamIDs != after.WhitelistTeamIDs
 }
 
 // UpdateOrgProtectBranch saves branch protection options of organizational repository.
@@ -207,8 +242,28 @@ func UpdateOrgProtectBranch(repo *Repository, protectBranch *ProtectBranch, whit
 		protectBranch.WhitelistTeamIDs = strings.Join(tool.Int64sToStrings(validTeamIDs), ",")
 	}
 
+	protectBranch.RequiredStatusChecks = formatRequiredStatusChecks(protectBranch.RequiredStatusCheckNames())
+
+	var previous *ProtectBranch
+	if protectBranch.ID != 0 {
+		existing := new(ProtectBranch)
+		has, err := x.ID(protectBranch.ID).Get(existing)
+		if err != nil {
+			return errors.Newf("get previous protect branch: %v", err)
+		}
+		if has {
+			previous = existing
+			if protectBranchRulesChanged(previous, protectBranch) {
+				protectBranch.RuleVersion = previous.RuleVersion + 1
+			} else {
+				protectBranch.RuleVersion = previous.RuleVersion
+			}
+		}
+	}
+
 	// Make sure protectBranch.ID is not 0 for whitelists
 	if protectBranch.ID == 0 {
+		protectBranch.RuleVersion = 1
 		if _, err = x.Insert(protectBranch); err != nil {
 			return errors.Newf("insert: %v", err)
 		}
@@ -273,4 +328,26 @@ func UpdateOrgProtectBranch(repo *Repository, protectBranch *ProtectBranch, whit
 func GetProtectBranchesByRepoID(repoID int64) ([]*ProtectBranch, error) {
 	protectBranches := make([]*ProtectBranch, 0, 2)
 	return protectBranches, x.Where("repo_id = ? and protected = ?", repoID, true).Asc("name").Find(&protectBranches)
+}
+
+// ResetOpenPullRequestsForRuleChange forces open pull requests targeting the
+// protected branch back to the checking state and queues a fresh conflict
+// test. Existing status checks are bound to the old rule version and stop
+// authorizing merges until they are re-reported.
+func ResetOpenPullRequestsForRuleChange(repoID int64, branch string) error {
+	prs, err := GetUnmergedPullRequestsByBaseInfo(repoID, branch)
+	if err != nil {
+		return errors.Wrap(err, "get unmerged pull requests by base info")
+	}
+	for _, pr := range prs {
+		if pr.Status == PullRequestStatusChecking {
+			continue
+		}
+		pr.Status = PullRequestStatusChecking
+		if err = pr.UpdateCols("status"); err != nil {
+			return errors.Wrapf(err, "reset pull request %d to checking", pr.ID)
+		}
+		pr.AddToTaskQueue()
+	}
+	return nil
 }

@@ -27,7 +27,7 @@ func TestDumpAndImport(t *testing.T) {
 	}
 	t.Parallel()
 
-	const wantTables = 8
+	const wantTables = 10
 	if len(Tables) != wantTables {
 		t.Fatalf("New table has added (want %d got %d), please add new tests for the table and update this check", wantTables, len(Tables))
 	}
@@ -192,6 +192,33 @@ func setupDBToDump(t *testing.T, db *gorm.DB) {
 			Type:        NoticeTypeRepository,
 			Description: "This is a notice",
 			CreatedUnix: 1588568886,
+		},
+
+		&StatusCheck{
+			ID:          1,
+			RepoID:      11,
+			CommitSHA:   "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+			BaseSHA:     "b1b2c3d4e5f6b1b2c3d4e5f6b1b2c3d4e5f6b1b2",
+			Name:        "ci/build",
+			State:       StatusCheckStateSuccess,
+			RuleVersion: 2,
+			CreatedUnix: 1588568886,
+			UpdatedUnix: 1588572486,
+		},
+
+		&MergeRequest{
+			ID:               1,
+			PullRequestID:    33,
+			HeadSHA:          "c1b2c3d4e5f6c1b2c3d4e5f6c1b2c3d4e5f6c1b2",
+			BaseSHA:          "b1b2c3d4e5f6b1b2c3d4e5f6b1b2c3d4e5f6b1b2",
+			DoerID:           1,
+			MergeStyle:       string(MergeStyleRegular),
+			State:            MergeRequestStateMerged,
+			MergedCommitID:   "d1b2c3d4e5f6d1b2c3d4e5f6d1b2c3d4e5f6d1b2",
+			Notified:         true,
+			LeaseExpiresUnix: 0,
+			CreatedUnix:      1588568886,
+			UpdatedUnix:      1588572486,
 		},
 	}
 	for _, val := range vals {

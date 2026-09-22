@@ -4,6 +4,12 @@ All notable changes to Gogs are documented in this file.
 
 ## 0.15.0+dev (`main`)
 
+### Added
+
+- Protected branches can now require named status checks. Merge buttons on both the web page and the API stay in a waiting state until every required check reports success for the current head commit, target branch tip and protection rule version.
+- Merge requests are now idempotent. Double clicks, retried API calls and webhook retries converge to a single merge result, and a pull request whose target branch moved during checks returns an explicit resynchronization message instead of overwriting the new history.
+- Restoring a database backup whose merge state disagrees with the repository on disk now surfaces an explicit resynchronization warning on the pull request page rather than silently choosing one side.
+
 ### Changed
 
 - Docker builds from `main` are now published only as `gogs/gogs:edge`, using the next-generation `Dockerfile.next`. The legacy `Dockerfile` no longer produces `main` builds. The `gogs/gogs:latest` and `gogs/gogs:next-latest` tags now always point to the highest published stable release, never to a back-patch on an older line. [#8278](https://github.com/gogs/gogs/pull/8278)
@@ -11,6 +17,7 @@ All notable changes to Gogs are documented in this file.
 
 ### Fixed
 
+- Merging a pull request into a protected branch could succeed on the page while a concurrent merge overwrote the target branch, or use stale check results from an older commit or an older protection rule. Both the merge write and the success notification now happen at most once.
 - _Security:_ On Windows hosts, an authenticated user with write access could write files into a repository's `.git` directory through a crafted tree path. [#8408](https://github.com/gogs/gogs/pull/8408) - [GHSA-85m5-cfw6-3cx8](https://github.com/gogs/gogs/security/advisories/GHSA-85m5-cfw6-3cx8)
 - _Security:_ Open redirect on the `/redirect` endpoint and post-action flows via a backslash in the redirect target. [#8391](https://github.com/gogs/gogs/pull/8391) - [GHSA-3g28-2vwg-gxq6](https://github.com/gogs/gogs/security/advisories/GHSA-3g28-2vwg-gxq6)
 - _Security:_ Argument injection through a crafted commit or branch reference on several repository API endpoints allowed an authenticated user with read access to leak internal server details to the error logs. [#8393](https://github.com/gogs/gogs/pull/8393) - [GHSA-mxrh-2rxr-6mqc](https://github.com/gogs/gogs/security/advisories/GHSA-mxrh-2rxr-6mqc)

@@ -616,6 +616,46 @@ function initRepository() {
         $(".commit.description.field").hide();
       }
     });
+
+    // Idempotent merge submit: disable on click and render server errors
+    // instead of pretending the merge succeeded.
+    $("form.merge-form").on("submit", function(e) {
+      var $form = $(this);
+      if ($form.data("submitting")) {
+        e.preventDefault();
+        return false;
+      }
+      $form.data("submitting", true);
+      var $button = $form.find(".merge-button");
+      var $message = $form.find(".merge-form-message");
+      var originalLabel = $button.find(".merge-button-label").text();
+      $button.prop("disabled", true).addClass("disabled");
+      $button.find(".merge-button-label").text($button.data("loading-label") || "...");
+      $message.prop("hidden", true).removeClass("error success").empty();
+
+      $.ajax({
+        type: "POST",
+        url: $form.attr("action"),
+        data: $form.serialize(),
+        dataType: "json"
+      }).done(function(resp) {
+        if (resp && resp.redirect) {
+          $message.addClass("success").text(resp.message || "").prop("hidden", false);
+          window.location.href = resp.redirect;
+          return;
+        }
+        // Already merged or equivalent idempotent success.
+        window.location.reload();
+      }).fail(function(xhr) {
+        $form.data("submitting", false);
+        $button.prop("disabled", false).removeClass("disabled");
+        $button.find(".merge-button-label").text(originalLabel);
+        var msg = (xhr.responseJSON && (xhr.responseJSON.message)) || "Merge failed, please try again.";
+        $message.addClass("error").text(msg).prop("hidden", false);
+      });
+      e.preventDefault();
+      return false;
+    });
   }
 }
 

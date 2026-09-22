@@ -629,6 +629,28 @@ func viewIssue(c *context.Context, isPullList bool) {
 		}
 	}
 
+	if issue.IsPull {
+		// Surface backup-restore inconsistencies explicitly instead of silently
+		// trusting one side. The page asks for a manual resynchronization.
+		if err := database.VerifyPullRequestConsistency(issue.PullRequest, c.Repo.GitRepo); err != nil {
+			if database.IsErrStateNeedsResync(err) {
+				c.Data["PullRequestResyncError"] = err.Error()
+			} else {
+				c.Error(err, "verify pull request consistency")
+				return
+			}
+		}
+
+		// Check status is computed live on every page load so stale green
+		// results from older commits, base tips or rule versions never render.
+		checkStatus, err := database.PullRequestMergeReadiness(issue.PullRequest, c.Repo.GitRepo)
+		if err != nil {
+			c.Error(err, "compute pull request check status")
+			return
+		}
+		c.Data["PullRequestCheckStatus"] = checkStatus
+	}
+
 	if issue.IsPull && issue.PullRequest.HasMerged {
 		pull := issue.PullRequest
 		branchProtected := false

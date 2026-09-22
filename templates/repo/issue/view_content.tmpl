@@ -148,14 +148,30 @@
 			{{end}}
 
 			{{if .Issue.IsPull}}
+				<style>
+					.pull-check-list { list-style: none; margin: 8px 0 0; padding: 0; }
+					.pull-check-list li { padding: 2px 0; font-size: 13px; }
+					.merge-form-message { margin-top: 8px; padding: 8px 12px; border-radius: 4px; }
+					.merge-form-message.error { background: #fff6f6; color: #9f3a38; }
+					.merge-form-message.success { background: #fcfff5; color: #2c662d; }
+					.octicon.spin { animation: gogs-spin 1.2s linear infinite; display: inline-block; }
+					@keyframes gogs-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+				</style>
+				{{if .PullRequestResyncError}}
+					<div class="ui error message" role="alert">
+						<div class="header">{{$.i18n.Tr "repo.pulls.resync_required_title"}}</div>
+						<p>{{.PullRequestResyncError}}</p>
+						<p>{{$.i18n.Tr "repo.pulls.resync_required_desc"}}</p>
+					</div>
+				{{end}}
 				<div class="comment merge box">
+					{{$checkStatus := .PullRequestCheckStatus}}
 					<a class="avatar text
 					{{if .Issue.PullRequest.HasMerged}}purple
 					{{else if .Issue.IsClosed}}grey
 					{{else if .IsPullReuqestBroken}}red
-					{{else if .Issue.PullRequest.IsChecking}}yellow
-					{{else if .Issue.PullRequest.CanAutoMerge}}green
-					{{else}}red{{end}}"><span class="mega-octicon octicon-git-merge"></span></a>
+					{{else if and $checkStatus (eq (printf "%s" $checkStatus.State) "success") (not .Issue.PullRequest.IsChecking)}}green
+					{{else}}yellow{{end}}"><span class="mega-octicon octicon-git-merge"></span></a>
 					<div class="content">
 						<div class="ui merge segment">
 							{{if .Issue.PullRequest.HasMerged}}
@@ -180,10 +196,36 @@
 									{{$.i18n.Tr "repo.pulls.data_broken"}}
 								</div>
 							{{else if .Issue.PullRequest.IsChecking}}
-								<div class="item text yellow">
+								<div class="item text yellow" role="status" aria-live="polite">
 									<span class="octicon octicon-sync"></span>
 									{{$.i18n.Tr "repo.pulls.is_checking"}}
 								</div>
+							{{else if and $checkStatus (eq (printf "%s" $checkStatus.State) "pending")}}
+								<div class="item text yellow" role="status" aria-live="polite">
+									<span class="octicon octicon-sync spin"></span>
+									{{$.i18n.Tr "repo.pulls.checks_pending"}}
+								</div>
+								{{if $checkStatus.StaleReason}}
+									<div class="item text grey">
+										<span class="octicon octicon-info"></span>
+										{{$checkStatus.StaleReason}}
+									</div>
+								{{end}}
+								<ul class="pull-check-list" aria-label="{{$.i18n.Tr "repo.pulls.required_checks"}}">
+									{{range $checkStatus.Required}}
+										<li class="text grey"><span class="octicon octicon-primitive-dot"></span> {{.}}</li>
+									{{end}}
+								</ul>
+							{{else if and $checkStatus (eq (printf "%s" $checkStatus.State) "failure")}}
+								<div class="item text red" role="alert">
+									<span class="octicon octicon-x"></span>
+									{{$.i18n.Tr "repo.pulls.checks_failed"}}
+								</div>
+								<ul class="pull-check-list" aria-label="{{$.i18n.Tr "repo.pulls.required_checks"}}">
+									{{range $checkStatus.Failed}}
+										<li class="text red"><span class="octicon octicon-x"></span> {{.}}</li>
+									{{end}}
+								</ul>
 							{{else if .Issue.PullRequest.CanAutoMerge}}
 								<div class="item text green">
 									<span class="octicon octicon-check"></span>
@@ -192,7 +234,7 @@
 
 								{{if .IsRepositoryWriter}}
 									<div class="ui divider"></div>
-									<form class="ui form" action="{{.Link}}/merge" method="post">
+									<form class="ui form merge-form" action="{{.Link}}/merge" method="post">
 										<div class="field">
 											<div class="ui radio checkbox">
 											  <input type="radio" name="merge_style" value="create_merge_commit" checked="checked">
@@ -213,9 +255,10 @@
 												<textarea id="commit_description" name="commit_description" tabindex="4" rows="3"></textarea>
 											</div>
 										</div>
-										<button class="ui green button">
-											<span class="octicon octicon-git-merge"></span> {{$.i18n.Tr "repo.pulls.merge_pull_request"}}
+										<button class="ui green button merge-button" type="submit" data-loading-label="{{$.i18n.Tr "repo.pulls.merging_pull_request"}}">
+											<span class="octicon octicon-git-merge"></span> <span class="merge-button-label">{{$.i18n.Tr "repo.pulls.merge_pull_request"}}</span>
 										</button>
+										<div class="merge-form-message" role="alert" aria-live="assertive" hidden></div>
 									</form>
 								{{end}}
 							{{else}}

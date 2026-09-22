@@ -398,6 +398,44 @@ func ViewPullFiles(c *context.Context) {
 	c.Success(tmplRepoPullsFiles)
 }
 
+// renderMergeConflict shows why a merge can not proceed with enough detail
+// for the user to act on. It is shared by double clicks, retries and required
+// check failures so all entry points give the same answer.
+func renderMergeConflict(c *context.Context, pr *database.PullRequest, err error) {
+	switch {
+	case database.IsErrRequiredChecksMissing(err):
+		c.JSON(http.StatusConflict, map[string]any{
+			"message": err.Error(),
+			"reason":  "required_checks_missing",
+			"detail":  requiredChecksErrorDetail(err.(database.ErrRequiredChecksMissing)),
+		})
+	case database.IsErrMergeRequestChanged(err):
+		c.JSON(http.StatusConflict, map[string]any{
+			"message": err.Error(),
+			"reason":  "changed",
+		})
+	case database.IsErrStateNeedsResync(err):
+		c.JSON(http.StatusConflict, map[string]any{
+			"message": err.Error(),
+			"reason":  "needs_resync",
+		})
+	default:
+		log.Error("Failed to merge pull request %d: %v", pr.ID, err)
+		c.JSON(http.StatusInternalServerError, map[string]any{
+			"message": "merge failed",
+			"reason":  "internal_error",
+		})
+	}
+}
+
+func requiredChecksErrorDetail(err database.ErrRequiredChecksMissing) map[string]any {
+	return map[string]any{
+		"missing": err.Missing,
+		"pending": err.Pending,
+		"failed":  err.Failed,
+	}
+}
+
 func MergePullRequest(c *context.Context) {
 	issue := checkPullInfo(c)
 	if c.Written() {
@@ -414,20 +452,56 @@ func MergePullRequest(c *context.Context) {
 		return
 	}
 
-	if !pr.CanAutoMerge() || pr.HasMerged {
-		c.NotFound()
+	if pr.HasMerged {
+		// Idempotent response for double clicks and retried requests.
+		c.JSON(http.StatusOK, map[string]any{
+			"message": "pull request is already merged",
+			"reason":  "already_merged",
+		})
+		return
+	}
+
+	// Detect backup-restore drift before any write is attempted.
+	if err = database.VerifyPullRequestConsistency(pr, c.Repo.GitRepo); err != nil {
+		if database.IsErrStateNeedsResync(err) {
+			renderMergeConflict(c, pr, err)
+		} else {
+			log.Error("Failed to verify pull request consistency %d: %v", pr.ID, err)
+			c.JSON(http.StatusInternalServerError, map[string]any{"message": "merge failed"})
+		}
 		return
 	}
 
 	pr.Issue = issue
 	pr.Issue.Repo = c.Repo.Repository
-	if err = pr.Merge(c.User, c.Repo.GitRepo, database.MergeStyle(c.Query("merge_style")), c.Query("commit_description")); err != nil {
-		c.Error(err, "merge")
+	result, err := database.MergePullRequestIdempotent(c.Req.Context(), database.MergePullRequestOptions{
+		PullRequest:       pr,
+		Doer:              c.User,
+		BaseGitRepo:       c.Repo.GitRepo,
+		MergeStyle:        database.MergeStyle(c.Query("merge_style")),
+		CommitDescription: c.Query("commit_description"),
+	})
+	if err != nil {
+		renderMergeConflict(c, pr, err)
+		return
+	}
+
+	if result.InProgress {
+		// The identical request is already running. Do not replay, ask the
+		// client to refresh and wait.
+		c.JSON(http.StatusConflict, map[string]any{
+			"message": "another merge for this pull request is in progress, refresh the page for the latest status",
+			"reason":  "in_progress",
+		})
 		return
 	}
 
 	log.Trace("Pull request merged: %d", pr.ID)
-	c.Redirect(c.Repo.RepoLink + "/pulls/" + strconv.FormatInt(pr.Index, 10))
+	c.JSON(http.StatusOK, map[string]any{
+		"redirect": c.Repo.RepoLink + "/pulls/" + strconv.FormatInt(pr.Index, 10),
+		"merged":   result.Merged,
+		"reason":   "merged",
+	})
 }
 
 func ParseCompareInfo(c *context.Context) (*database.User, *database.Repository, *git.Repository, *gitx.PullRequestMeta, string, string) {

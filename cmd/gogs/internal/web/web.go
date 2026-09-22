@@ -515,6 +515,8 @@ func Run(configPath string, portOverride int) error {
 				m.Post("/merge", reqRepoWriter, repo.MergePullRequest)
 			}, repo.MustAllowPulls)
 
+			m.Post("/statuses/:sha([a-f0-9]{7,40})", reqRepoWriter, repo.CreateStatusCheck)
+
 			m.Group("", func() {
 				m.Get("/src/*", repo.Home)
 				m.Get("/commits/*", repo.RefCommits)

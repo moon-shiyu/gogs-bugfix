@@ -578,9 +578,11 @@ func SettingsProtectedBranchPost(c *context.Context, f form.ProtectBranch) {
 		}
 	}
 
+	previousRuleVersion := protectBranch.RuleVersion
 	protectBranch.Protected = f.Protected
 	protectBranch.RequirePullRequest = f.RequirePullRequest
 	protectBranch.EnableWhitelist = f.EnableWhitelist
+	protectBranch.RequiredStatusChecks = f.RequiredStatusChecks
 	if c.Repo.Owner.IsOrganization() {
 		err = database.UpdateOrgProtectBranch(c.Repo.Repository, protectBranch, f.WhitelistUsers, f.WhitelistTeams)
 	} else {
@@ -589,6 +591,14 @@ func SettingsProtectedBranchPost(c *context.Context, f form.ProtectBranch) {
 	if err != nil {
 		c.Error(err, "update protect branch")
 		return
+	}
+
+	// New rules invalidate waiting merges, they must re-evaluate instead of
+	// passing on checks accepted under the old rules.
+	if protectBranch.RuleVersion != previousRuleVersion {
+		if err = database.ResetOpenPullRequestsForRuleChange(c.Repo.Repository.ID, branch); err != nil {
+			log.Error("Failed to reset pull requests after rule change [repo_id: %d, branch: %s]: %v", c.Repo.Repository.ID, branch, err)
+		}
 	}
 
 	c.Flash.Success(c.Tr("repo.settings.update_protect_branch_success"))

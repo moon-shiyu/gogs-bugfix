@@ -56,6 +56,7 @@ func init() {
 		new(Label), new(IssueLabel), new(Milestone),
 		new(Mirror), new(Release), new(Webhook), new(HookTask),
 		new(ProtectBranch), new(ProtectBranchWhitelist),
+		new(StatusCheck), new(MergeRequest),
 		new(Team), new(OrgUser), new(TeamUser), new(TeamRepo),
 	)
 

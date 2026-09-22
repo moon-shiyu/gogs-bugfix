@@ -1728,3 +1728,39 @@
   }
   .generate-tab-size(@n, (@i + 1));
 }
+
+.pull-check-list {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+
+  li {
+    padding: 2px 0;
+    font-size: 13px;
+  }
+}
+
+.merge-form-message {
+  margin-top: 8px;
+  padding: 8px 12px;
+  border-radius: 4px;
+
+  &.error {
+    background: #fff6f6;
+    color: #9f3a38;
+  }
+
+  &.success {
+    background: #fcfff5;
+    color: #2c662d;
+  }
+}
+
+.octicon.spin {
+  animation: gogs-spin 1.2s linear infinite;
+}
+
+@keyframes gogs-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
